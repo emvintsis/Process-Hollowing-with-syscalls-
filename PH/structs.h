@@ -20,10 +20,3 @@ typedef NTSTATUS(NTAPI* NtQueryInformationProcess_t)(
 	ULONG ProcessInformationLength, 
 	PULONG ReturnLength);
 
-typedef NTSTATUS(NTAPI* NtAllocateVirtualMemory_t) (
-	IN HANDLE               ProcessHandle,
-	IN OUT PVOID* BaseAddress,
-	IN ULONG                ZeroBits,
-	IN OUT PULONG           RegionSize,
-	IN ULONG                AllocationType,
-	IN ULONG                Protect);

