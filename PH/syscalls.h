@@ -22,6 +22,20 @@ extern NTSTATUS NtWriteVirtualMemory(
 	IN ULONG                NumberOfBytesToWrite,
 	OUT PULONG              NumberOfBytesWritten OPTIONAL);
 
+extern NTSTATUS NtReadVirtualMemory(
+	IN HANDLE               ProcessHandle,
+	IN PVOID                BaseAddress,
+	OUT PVOID               Buffer,
+	IN ULONG                NumberOfBytesToRead,
+	OUT PULONG              NumberOfBytesReaded OPTIONAL);
+
+extern NTSTATUS NtSetContextThread(
+	IN HANDLE               ThreadHandle,
+	IN PCONTEXT             Context);
+
+extern NTSTATUS NtGetContextThread(
+	IN HANDLE               ThreadHandle,
+	OUT PCONTEXT            pContext);
 
 #ifdef __cplusplus  
 }
